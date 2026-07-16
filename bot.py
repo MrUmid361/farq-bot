@@ -147,7 +147,7 @@ def read_html_xls(path: str) -> ParsedFile:
         encoding = m.group(1).decode("ascii", errors="ignore")
 
     html = raw.decode(encoding, errors="ignore")
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
 
     table, n_rows = _find_product_table(soup)
     if table is None or n_rows < 2:
