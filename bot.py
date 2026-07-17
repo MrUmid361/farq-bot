@@ -15,6 +15,7 @@ Bo'limlar:
   - Kredit/lizing to'lov jadvali
   - Moliyaviy koeffitsientlar
   - YATT uchun soliq (ma'lumot)
+  - Fakturalar asosida chorak bo'yicha foyda solig'i hisoboti
 
 O'RNATISH:
     pip install python-telegram-bot==21.* pandas openpyxl beautifulsoup4 lxml xlrd requests
@@ -58,7 +59,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # ---------------- Conversation holatlari ----------------
-MENU, TEXT_INPUT, WAITING_FILE_1, WAITING_FILE_2, WAITING_VALIDATE_FILE = range(5)
+MENU, TEXT_INPUT, WAITING_FILE_1, WAITING_FILE_2, WAITING_VALIDATE_FILE, WAITING_TAX_REPORT_FILE = range(6)
 
 
 # ================================================================
@@ -358,7 +359,198 @@ def validate_file(pf: ParsedFile) -> tuple[bytes, int]:
 
 
 # ================================================================
-#        3) GENERIK QADAM-BA-QADAM HISOB-KITOB MOTORI
+#   3) FAKTURALAR ASOSIDA CHORAK BO'YICHA FOYDA SOLIG'I HISOBOTI
+# ================================================================
+
+DOCS_COLUMN_MAP = {
+    "seller_inn": "Продавец (ИНН или ПИНФЛ)",
+    "seller_name": "Продавец (наименование)",
+    "buyer_inn": "Покупатель (ИНН или ПИНФЛ)",
+    "buyer_name": "Покупатель (наименование)",
+    "doc_number": "Номер документ",
+    "doc_date": "Дата документ",
+    "description": "Примечание к товару (работе, услуге)",
+    "summa_no_vat": "Стоимость поставки",
+    "vat_rate": "НДС ставка",
+    "vat_sum": "НДС сумма",
+    "summa_with_vat": "Стоимость поставки с учётом НДС",
+}
+
+
+def parse_docs_export(path: str) -> pd.DataFrame:
+    """soliqservis.uz / didox.uz dan yuklab olinadigan 'docs' eksport faylini o'qiydi."""
+    df_raw = None
+    for header_row in (1, 0, 2):
+        try:
+            candidate = pd.read_excel(path, header=header_row)
+            if DOCS_COLUMN_MAP["seller_inn"] in candidate.columns:
+                df_raw = candidate
+                break
+        except Exception:
+            continue
+
+    if df_raw is None:
+        raise ValueError(
+            "Fayl formati tanilmadi. Bu 'docs' eksport fayli (soliqservis.uz/didox.uz) "
+            "ekanligiga ishonch hosil qiling."
+        )
+
+    missing = [v for v in DOCS_COLUMN_MAP.values() if v not in df_raw.columns]
+    if missing:
+        raise ValueError("Faylda kerakli ustunlar topilmadi: " + ", ".join(missing))
+
+    out = pd.DataFrame()
+    out["seller_inn"] = df_raw[DOCS_COLUMN_MAP["seller_inn"]].astype(str).str.strip()
+    out["seller_name"] = df_raw[DOCS_COLUMN_MAP["seller_name"]].astype(str).str.strip()
+    out["buyer_inn"] = df_raw[DOCS_COLUMN_MAP["buyer_inn"]].astype(str).str.strip()
+    out["buyer_name"] = df_raw[DOCS_COLUMN_MAP["buyer_name"]].astype(str).str.strip()
+    out["doc_number"] = df_raw[DOCS_COLUMN_MAP["doc_number"]].astype(str).str.strip()
+    out["doc_date"] = pd.to_datetime(df_raw[DOCS_COLUMN_MAP["doc_date"]], format="%d-%m-%Y", errors="coerce")
+    out["description"] = df_raw[DOCS_COLUMN_MAP["description"]].astype(str).str.strip()
+    out["summa_no_vat"] = df_raw[DOCS_COLUMN_MAP["summa_no_vat"]].apply(_to_number).fillna(0.0)
+    out["vat_rate"] = df_raw[DOCS_COLUMN_MAP["vat_rate"]].apply(_to_number).fillna(0.0)
+    out["vat_sum"] = df_raw[DOCS_COLUMN_MAP["vat_sum"]].apply(_to_number).fillna(0.0)
+    out["summa_with_vat"] = df_raw[DOCS_COLUMN_MAP["summa_with_vat"]].apply(_to_number).fillna(0.0)
+    out = out.dropna(subset=["doc_date"])
+    return out
+
+
+QUARTER_MONTHS = {
+    "1": (1, 3),
+    "2": (4, 6),
+    "3": (7, 9),
+    "4": (10, 12),
+}
+QUARTER_LABELS = {
+    "1": "I-chorak (yanvar-mart)",
+    "2": "II-chorak (aprel-iyun)",
+    "3": "III-chorak (iyul-sentabr)",
+    "4": "IV-chorak (oktabr-dekabr)",
+    "all": "Yil boshidan hozirgacha",
+}
+
+
+def compute_tax_report(answers: dict, df: pd.DataFrame):
+    own_inn = re.sub(r"\D", "", answers["inn"])
+    chorak = answers["chorak"]
+
+    if df.empty:
+        return "❌ Faylda sanasi to'g'ri o'qilgan qatorlar topilmadi."
+
+    year = int(df["doc_date"].dt.year.max())
+
+    if chorak == "all":
+        start = datetime(year, 1, 1)
+        end = df["doc_date"].max()
+    else:
+        m1, m2 = QUARTER_MONTHS[chorak]
+        start = datetime(year, m1, 1)
+        end_month_last_day = 31 if m2 in (1, 3, 5, 7, 8, 10, 12) else (30 if m2 != 2 else 28)
+        end = datetime(year, m2, end_month_last_day, 23, 59, 59)
+
+    period_df = df[(df["doc_date"] >= start) & (df["doc_date"] <= end)]
+
+    income_rows = period_df[period_df["seller_inn"] == own_inn]
+    expense_rows = period_df[period_df["buyer_inn"] == own_inn]
+    matched_ids = set(income_rows.index) | set(expense_rows.index)
+    unmatched = period_df[~period_df.index.isin(matched_ids)]
+
+    daromad = income_rows["summa_no_vat"].sum()
+    xarajat = expense_rows["summa_no_vat"].sum()
+    qqs_daromad = income_rows["vat_sum"].sum()
+    qqs_xarajat = expense_rows["vat_sum"].sum()
+    baza = daromad - xarajat
+    soliq = baza * 0.15 if baza > 0 else 0.0
+
+    # ---- Excel hisobot ----
+    wb = openpyxl.Workbook()
+    bold = Font(name="Arial", bold=True)
+    title_font = Font(name="Arial", bold=True, size=13)
+    header_fill = PatternFill("solid", fgColor="D9E1F2")
+
+    ws = wb.active
+    ws.title = "Xulosa"
+    ws["A1"] = f"Foyda solig'i hisoboti — {QUARTER_LABELS[chorak]} ({year})"
+    ws["A1"].font = title_font
+    ws.merge_cells("A1:B1")
+    ws["A2"] = f"Kompaniya STIR: {own_inn}"
+
+    rows = [
+        ("Davr boshi", start.strftime("%d.%m.%Y")),
+        ("Davr oxiri", end.strftime("%d.%m.%Y")),
+        ("", ""),
+        ("Jami daromad (QQS'siz)", round(daromad, 2)),
+        ("Jami xarajat (QQS'siz)", round(xarajat, 2)),
+        ("Soliq solinadigan foyda", round(baza, 2)),
+        ("Foyda solig'i (15%)", round(soliq, 2)),
+        ("", ""),
+        ("Sotuvlar bo'yicha QQS", round(qqs_daromad, 2)),
+        ("Xaridlar bo'yicha QQS", round(qqs_xarajat, 2)),
+        ("", ""),
+        ("Daromad fakturalari soni", len(income_rows)),
+        ("Xarajat fakturalari soni", len(expense_rows)),
+        ("Aniqlanmagan (na sotuvchi, na xaridor mos kelmadi)", len(unmatched)),
+    ]
+    r = 4
+    for label, val in rows:
+        ws.cell(row=r, column=1, value=label).font = Font(name="Arial", bold=label not in ("", None))
+        ws.cell(row=r, column=2, value=val)
+        r += 1
+    ws.column_dimensions["A"].width = 48
+    ws.column_dimensions["B"].width = 20
+
+    def _write_invoice_sheet(name, rows_df):
+        sh = wb.create_sheet(name)
+        headers = ["Sana", "Hujjat №", "Kontragent", "Tavsif", "Summa (QQS'siz)", "QQS", "Jami (QQS bilan)"]
+        sh.append(headers)
+        for c in range(1, len(headers) + 1):
+            cell = sh.cell(row=1, column=c)
+            cell.font = bold
+            cell.fill = header_fill
+        for i, (_, row) in enumerate(rows_df.sort_values("doc_date").iterrows()):
+            rr = i + 2
+            kontragent = row["buyer_name"] if name == "Daromad fakturalari" else row["seller_name"]
+            sh.cell(row=rr, column=1, value=row["doc_date"].strftime("%d.%m.%Y"))
+            sh.cell(row=rr, column=2, value=row["doc_number"])
+            sh.cell(row=rr, column=3, value=kontragent)
+            sh.cell(row=rr, column=4, value=row["description"])
+            sh.cell(row=rr, column=5, value=round(row["summa_no_vat"], 2))
+            sh.cell(row=rr, column=6, value=round(row["vat_sum"], 2))
+            sh.cell(row=rr, column=7, value=round(row["summa_with_vat"], 2))
+        widths = [12, 26, 32, 40, 16, 14, 16]
+        for i, w in enumerate(widths, start=1):
+            sh.column_dimensions[get_column_letter(i)].width = w
+        sh.freeze_panes = "A2"
+
+    _write_invoice_sheet("Daromad fakturalari", income_rows)
+    _write_invoice_sheet("Xarajat fakturalari", expense_rows)
+    if len(unmatched) > 0:
+        _write_invoice_sheet("Aniqlanmagan", unmatched)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    text = (
+        f"📑 Foyda solig'i hisoboti — {QUARTER_LABELS[chorak]} ({year})\n\n"
+        f"Davr: {start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}\n\n"
+        f"Jami daromad (QQS'siz): {daromad:,.0f} so'm ({len(income_rows)} ta faktura)\n"
+        f"Jami xarajat (QQS'siz): {xarajat:,.0f} so'm ({len(expense_rows)} ta faktura)\n"
+        f"Soliq solinadigan foyda: {baza:,.0f} so'm\n"
+        f"✅ Foyda solig'i (15%): {soliq:,.0f} so'm\n"
+    )
+    if len(unmatched) > 0:
+        text += (
+            f"\n⚠️ {len(unmatched)} ta qatorda STIR na sotuvchi, na xaridur sifatida topilmadi "
+            f"— ular alohida 'Aniqlanmagan' varag'ida ko'rsatildi, hisobga kiritilmadi."
+        )
+    text += "\n\nTo'liq hisobotni Excel faylida yuboryapman 👇"
+
+    return text, buf.getvalue(), f"foyda_soligi_{QUARTER_LABELS[chorak].split()[0]}_{year}.xlsx"
+
+
+# ================================================================
+#        4) GENERIK QADAM-BA-QADAM HISOB-KITOB MOTORI
 # ================================================================
 
 def parse_value(raw: str, vtype: str):
@@ -796,6 +988,26 @@ FLOWS = {
         ],
         "compute": compute_ratios,
     },
+    "tax_report": {
+        "title": "📑 Fakturalar asosida foyda solig'i",
+        "steps": [
+            {"key": "inn", "prompt": "1/2. Kompaniyangizning STIR (INN) raqamini kiriting (9 xonali):", "type": "text"},
+            {
+                "key": "chorak",
+                "prompt": "2/2. Qaysi davr uchun hisoblaymiz?",
+                "type": "choice",
+                "options": [
+                    ("I-chorak (yanvar-mart)", "1"),
+                    ("II-chorak (aprel-iyun)", "2"),
+                    ("III-chorak (iyul-sentabr)", "3"),
+                    ("IV-chorak (oktabr-dekabr)", "4"),
+                    ("Yil boshidan hozirgacha", "all"),
+                ],
+            },
+        ],
+        "compute": None,
+        "needs_file": True,
+    },
 }
 
 
@@ -807,6 +1019,7 @@ MAIN_MENU_LAYOUT = [
     [("📄 Hisob-faktura", "menu:invoice"), ("📆 Ish kunlari", "menu:workdays")],
     [("🏦 Kredit jadvali", "menu:loan"), ("📈 Moliyaviy koeffitsientlar", "menu:ratios")],
     [("🧾 YATT uchun soliq", "menu:yatt")],
+    [("📑 Fakturalar → foyda solig'i (chorak)", "menu:tax_report")],
 ]
 
 
@@ -906,8 +1119,16 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_current_step(query, context)
         return TEXT_INPUT
     else:
-        await _finish_flow(query.message, context)
-        return MENU
+        return await _steps_complete(query.message, context, flow)
+
+
+async def _steps_complete(message, context, flow):
+    """Barcha qadamlar to'ldirilgach chaqiriladi: yoki hisoblaydi, yoki fayl so'raydi."""
+    if flow.get("needs_file"):
+        await message.reply_text("Endi kerakli Excel faylni yuboring (.xlsx).")
+        return WAITING_TAX_REPORT_FILE
+    await _finish_flow(message, context)
+    return MENU
 
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -931,8 +1152,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_current_step_message(update.message, context)
         return TEXT_INPUT
     else:
-        await _finish_flow(update.message, context)
-        return MENU
+        return await _steps_complete(update.message, context, flow)
 
 
 async def ask_current_step_message(message, context):
@@ -1043,6 +1263,40 @@ async def receive_validate_file(update: Update, context: ContextTypes.DEFAULT_TY
     return MENU
 
 
+async def receive_tax_report_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc: Document = update.message.document
+    if not doc or not doc.file_name.lower().endswith((".xlsx", ".xls", ".xlsm")):
+        await update.message.reply_text("Iltimos, .xlsx fayl yuboring.")
+        return WAITING_TAX_REPORT_FILE
+
+    path = f"/tmp/{update.effective_chat.id}_tr_{doc.file_name}"
+    file = await doc.get_file()
+    await file.download_to_drive(path)
+
+    await update.message.reply_text("Fayl qabul qilindi ✅. Hisoblanmoqda...")
+
+    try:
+        df = parse_docs_export(path)
+        result = compute_tax_report(context.user_data.get("answers", {}), df)
+    except Exception as e:
+        logger.exception("Foyda solig'i hisobotida xatolik")
+        await update.message.reply_text(f"❌ Xatolik yuz berdi: {e}")
+        context.user_data.clear()
+        await show_main_menu(update.message, "Menyuga qaytdik:")
+        return MENU
+
+    if isinstance(result, tuple):
+        text, file_bytes, filename = result
+        await update.message.reply_text(text)
+        await update.message.reply_document(document=io.BytesIO(file_bytes), filename=filename)
+    else:
+        await update.message.reply_text(result)
+
+    context.user_data.clear()
+    await show_main_menu(update.message, "Yana biror bo'limni tanlashingiz mumkin:")
+    return MENU
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Bekor qilindi.")
@@ -1067,6 +1321,7 @@ def main():
             WAITING_FILE_1: [MessageHandler(filters.Document.ALL, receive_file_1)],
             WAITING_FILE_2: [MessageHandler(filters.Document.ALL, receive_file_2)],
             WAITING_VALIDATE_FILE: [MessageHandler(filters.Document.ALL, receive_validate_file)],
+            WAITING_TAX_REPORT_FILE: [MessageHandler(filters.Document.ALL, receive_tax_report_file)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
