@@ -84,6 +84,16 @@ def _norm(s):
     return str(s).strip().lower()
 
 
+def _make_soup(html: str) -> BeautifulSoup:
+    """lxml o'rnatilmagan bo'lsa ham ishlab turishi uchun parserlar orasida tanlaydi."""
+    for parser in ("lxml", "html.parser"):
+        try:
+            return BeautifulSoup(html, parser)
+        except Exception:
+            continue
+    return BeautifulSoup(html, "html.parser")
+
+
 def _to_number(x):
     if x is None:
         return None
@@ -160,7 +170,7 @@ def read_html_xls(path: str) -> ParsedFile:
         encoding = m.group(1).decode("ascii", errors="ignore")
 
     html = raw.decode(encoding, errors="ignore")
-    soup = BeautifulSoup(html, "lxml")
+    soup = _make_soup(html)
 
     table, n_rows = _find_product_table(soup)
     if table is None or n_rows < 2:
@@ -454,7 +464,7 @@ def extract_income_from_html(path: str):
         encoding = m.group(1).decode("ascii", errors="ignore")
 
     html = raw.decode(encoding, errors="ignore")
-    soup = BeautifulSoup(html, "lxml")
+    soup = _make_soup(html)
 
     full_text = soup.get_text(" ", strip=True)
     stir_match = re.search(r"СТИР\s+(\d{9})", full_text)
