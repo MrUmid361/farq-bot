@@ -377,6 +377,18 @@ DOCS_COLUMN_MAP = {
 }
 
 
+def _normalize_inn(x):
+    """STIR/INN qiymatini tozalaydi: '303020732.0' -> '303020732', bo'sh -> ''."""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    s = str(x).strip()
+    if s.lower() in ("nan", "none", ""):
+        return ""
+    if s.endswith(".0"):
+        s = s[:-2]
+    return re.sub(r"\D", "", s)
+
+
 def parse_docs_export(path: str) -> pd.DataFrame:
     """soliqservis.uz / didox.uz dan yuklab olinadigan 'docs' eksport faylini o'qiydi."""
     df_raw = None
@@ -400,9 +412,9 @@ def parse_docs_export(path: str) -> pd.DataFrame:
         raise ValueError("Faylda kerakli ustunlar topilmadi: " + ", ".join(missing))
 
     out = pd.DataFrame()
-    out["seller_inn"] = df_raw[DOCS_COLUMN_MAP["seller_inn"]].astype(str).str.strip()
+    out["seller_inn"] = df_raw[DOCS_COLUMN_MAP["seller_inn"]].apply(_normalize_inn)
     out["seller_name"] = df_raw[DOCS_COLUMN_MAP["seller_name"]].astype(str).str.strip()
-    out["buyer_inn"] = df_raw[DOCS_COLUMN_MAP["buyer_inn"]].astype(str).str.strip()
+    out["buyer_inn"] = df_raw[DOCS_COLUMN_MAP["buyer_inn"]].apply(_normalize_inn)
     out["buyer_name"] = df_raw[DOCS_COLUMN_MAP["buyer_name"]].astype(str).str.strip()
     out["doc_number"] = df_raw[DOCS_COLUMN_MAP["doc_number"]].astype(str).str.strip()
     out["doc_date"] = pd.to_datetime(df_raw[DOCS_COLUMN_MAP["doc_date"]], format="%d-%m-%Y", errors="coerce")
