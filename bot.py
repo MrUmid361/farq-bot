@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # ---------------- Conversation holatlari ----------------
-MENU, TEXT_INPUT, WAITING_FILE_1, WAITING_FILE_2, WAITING_VALIDATE_FILE, WAITING_TAX_REPORT_FILE = range(6)
+MENU, TEXT_INPUT, WAITING_FILE_1, WAITING_FILE_2, WAITING_VALIDATE_FILE, WAITING_TAX_INCOME_FILE, WAITING_TAX_EXPENSE_FILE = range(7)
 
 
 # ================================================================
@@ -427,6 +427,71 @@ def parse_docs_export(path: str) -> pd.DataFrame:
     return out
 
 
+def _html_number(s):
+    """HTML sahifadagi '40,744,736.17' kabi sonlarni o'qiydi (vergul=mingliklar ajratuvchisi)."""
+    if s is None:
+        return None
+    s = str(s).strip().replace("\xa0", "").replace(" ", "").replace(",", "")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if s in ("", "-", "."):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def extract_income_from_html(path: str):
+    """soliq.uz shaxsiy kabinetidan saqlangan HTML sahifadan '6-Илова'даги
+    010-satr (Йил бошидан жами товарларни (хизматларни) реализация қилиш
+    айланмалари) qiymatini o'qiydi. (stir, daromad_summasi) qaytaradi."""
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    encoding = "utf-8"
+    m = re.search(rb"charset=([\w-]+)", raw[:4000], re.IGNORECASE)
+    if m:
+        encoding = m.group(1).decode("ascii", errors="ignore")
+
+    html = raw.decode(encoding, errors="ignore")
+    soup = BeautifulSoup(html, "lxml")
+
+    full_text = soup.get_text(" ", strip=True)
+    stir_match = re.search(r"СТИР\s+(\d{9})", full_text)
+    stir = stir_match.group(1) if stir_match else None
+
+    target_table = None
+    for t in soup.find_all("table"):
+        txt = t.get_text(" ", strip=True)
+        if "Йил бошидан жами товарларни" in txt and "реализация" in txt:
+            target_table = t
+            break
+
+    if target_table is None:
+        raise ValueError(
+            "Faylda '6-Илова: Йил бошидан товарларни (хизматларни) реализация қилиш "
+            "бўйича айланмалар' jadvali topilmadi. To'g'ri sahifa saqlanganiga ishonch hosil qiling."
+        )
+
+    daromad = None
+    for tr in target_table.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        if "010" in cells:
+            idx = cells.index("010")
+            for v in cells[idx + 1:]:
+                if v and v not in ("x", "х"):
+                    num = _html_number(v)
+                    if num is not None:
+                        daromad = num
+                        break
+            break
+
+    if daromad is None:
+        raise ValueError("010-satr ('Йил бошидан жами товарларни...') qiymati topilmadi.")
+
+    return stir, daromad
+
+
 QUARTER_MONTHS = {
     "1": (1, 3),
     "2": (4, 6),
@@ -442,34 +507,30 @@ QUARTER_LABELS = {
 }
 
 
-def compute_tax_report(answers: dict, df: pd.DataFrame):
-    own_inn = re.sub(r"\D", "", answers["inn"])
+def compute_tax_report(answers: dict, daromad: float, expense_df: pd.DataFrame):
+    own_inn = _normalize_inn(answers["inn"])
     chorak = answers["chorak"]
 
-    if df.empty:
-        return "❌ Faylda sanasi to'g'ri o'qilgan qatorlar topilmadi."
-
-    year = int(df["doc_date"].dt.year.max())
-
-    if chorak == "all":
+    if expense_df.empty:
+        year = datetime.now().year
         start = datetime(year, 1, 1)
-        end = df["doc_date"].max()
+        end = datetime.now()
     else:
-        m1, m2 = QUARTER_MONTHS[chorak]
-        start = datetime(year, m1, 1)
-        end_month_last_day = 31 if m2 in (1, 3, 5, 7, 8, 10, 12) else (30 if m2 != 2 else 28)
-        end = datetime(year, m2, end_month_last_day, 23, 59, 59)
+        year = int(expense_df["doc_date"].dt.year.max())
+        if chorak == "all":
+            start = datetime(year, 1, 1)
+            end = expense_df["doc_date"].max()
+        else:
+            m1, m2 = QUARTER_MONTHS[chorak]
+            start = datetime(year, m1, 1)
+            end_month_last_day = 31 if m2 in (1, 3, 5, 7, 8, 10, 12) else (30 if m2 != 2 else 28)
+            end = datetime(year, m2, end_month_last_day, 23, 59, 59)
 
-    period_df = df[(df["doc_date"] >= start) & (df["doc_date"] <= end)]
-
-    income_rows = period_df[period_df["seller_inn"] == own_inn]
+    period_df = expense_df[(expense_df["doc_date"] >= start) & (expense_df["doc_date"] <= end)]
     expense_rows = period_df[period_df["buyer_inn"] == own_inn]
-    matched_ids = set(income_rows.index) | set(expense_rows.index)
-    unmatched = period_df[~period_df.index.isin(matched_ids)]
+    excluded_count = len(period_df) - len(expense_rows)
 
-    daromad = income_rows["summa_no_vat"].sum()
     xarajat = expense_rows["summa_no_vat"].sum()
-    qqs_daromad = income_rows["vat_sum"].sum()
     qqs_xarajat = expense_rows["vat_sum"].sum()
     baza = daromad - xarajat
     soliq = baza * 0.15 if baza > 0 else 0.0
@@ -491,53 +552,44 @@ def compute_tax_report(answers: dict, df: pd.DataFrame):
         ("Davr boshi", start.strftime("%d.%m.%Y")),
         ("Davr oxiri", end.strftime("%d.%m.%Y")),
         ("", ""),
-        ("Jami daromad (QQS'siz)", round(daromad, 2)),
-        ("Jami xarajat (QQS'siz)", round(xarajat, 2)),
+        ("Jami daromad (QQS'siz, soliq.uz 6-ilova 010-satr)", round(daromad, 2)),
+        ("Jami xarajat (QQS'siz, fakturalar bo'yicha)", round(xarajat, 2)),
         ("Soliq solinadigan foyda", round(baza, 2)),
         ("Foyda solig'i (15%)", round(soliq, 2)),
         ("", ""),
-        ("Sotuvlar bo'yicha QQS", round(qqs_daromad, 2)),
         ("Xaridlar bo'yicha QQS", round(qqs_xarajat, 2)),
         ("", ""),
-        ("Daromad fakturalari soni", len(income_rows)),
-        ("Xarajat fakturalari soni", len(expense_rows)),
-        ("Aniqlanmagan (na sotuvchi, na xaridor mos kelmadi)", len(unmatched)),
+        ("Xarajat fakturalari soni (hisobga olingan)", len(expense_rows)),
+        ("Boshqa STIRga tegishli qatorlar (hisobga olinmadi)", excluded_count),
     ]
     r = 4
     for label, val in rows:
-        ws.cell(row=r, column=1, value=label).font = Font(name="Arial", bold=label not in ("", None))
+        ws.cell(row=r, column=1, value=label).font = Font(name="Arial", bold=bool(label))
         ws.cell(row=r, column=2, value=val)
         r += 1
-    ws.column_dimensions["A"].width = 48
+    ws.column_dimensions["A"].width = 52
     ws.column_dimensions["B"].width = 20
 
-    def _write_invoice_sheet(name, rows_df):
-        sh = wb.create_sheet(name)
-        headers = ["Sana", "Hujjat №", "Kontragent", "Tavsif", "Summa (QQS'siz)", "QQS", "Jami (QQS bilan)"]
-        sh.append(headers)
-        for c in range(1, len(headers) + 1):
-            cell = sh.cell(row=1, column=c)
-            cell.font = bold
-            cell.fill = header_fill
-        for i, (_, row) in enumerate(rows_df.sort_values("doc_date").iterrows()):
-            rr = i + 2
-            kontragent = row["buyer_name"] if name == "Daromad fakturalari" else row["seller_name"]
-            sh.cell(row=rr, column=1, value=row["doc_date"].strftime("%d.%m.%Y"))
-            sh.cell(row=rr, column=2, value=row["doc_number"])
-            sh.cell(row=rr, column=3, value=kontragent)
-            sh.cell(row=rr, column=4, value=row["description"])
-            sh.cell(row=rr, column=5, value=round(row["summa_no_vat"], 2))
-            sh.cell(row=rr, column=6, value=round(row["vat_sum"], 2))
-            sh.cell(row=rr, column=7, value=round(row["summa_with_vat"], 2))
-        widths = [12, 26, 32, 40, 16, 14, 16]
-        for i, w in enumerate(widths, start=1):
-            sh.column_dimensions[get_column_letter(i)].width = w
-        sh.freeze_panes = "A2"
-
-    _write_invoice_sheet("Daromad fakturalari", income_rows)
-    _write_invoice_sheet("Xarajat fakturalari", expense_rows)
-    if len(unmatched) > 0:
-        _write_invoice_sheet("Aniqlanmagan", unmatched)
+    ws2 = wb.create_sheet("Xarajat fakturalari")
+    headers = ["Sana", "Hujjat №", "Sotuvchi", "Tavsif", "Summa (QQS'siz)", "QQS", "Jami (QQS bilan)"]
+    ws2.append(headers)
+    for c in range(1, len(headers) + 1):
+        cell = ws2.cell(row=1, column=c)
+        cell.font = bold
+        cell.fill = header_fill
+    for i, (_, row) in enumerate(expense_rows.sort_values("doc_date").iterrows()):
+        rr = i + 2
+        ws2.cell(row=rr, column=1, value=row["doc_date"].strftime("%d.%m.%Y"))
+        ws2.cell(row=rr, column=2, value=row["doc_number"])
+        ws2.cell(row=rr, column=3, value=row["seller_name"])
+        ws2.cell(row=rr, column=4, value=row["description"])
+        ws2.cell(row=rr, column=5, value=round(row["summa_no_vat"], 2))
+        ws2.cell(row=rr, column=6, value=round(row["vat_sum"], 2))
+        ws2.cell(row=rr, column=7, value=round(row["summa_with_vat"], 2))
+    widths = [12, 26, 32, 40, 16, 14, 16]
+    for i, w in enumerate(widths, start=1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+    ws2.freeze_panes = "A2"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -546,15 +598,15 @@ def compute_tax_report(answers: dict, df: pd.DataFrame):
     text = (
         f"📑 Foyda solig'i hisoboti — {QUARTER_LABELS[chorak]} ({year})\n\n"
         f"Davr: {start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}\n\n"
-        f"Jami daromad (QQS'siz): {daromad:,.0f} so'm ({len(income_rows)} ta faktura)\n"
+        f"Jami daromad (QQS'siz): {daromad:,.0f} so'm\n"
         f"Jami xarajat (QQS'siz): {xarajat:,.0f} so'm ({len(expense_rows)} ta faktura)\n"
         f"Soliq solinadigan foyda: {baza:,.0f} so'm\n"
         f"✅ Foyda solig'i (15%): {soliq:,.0f} so'm\n"
     )
-    if len(unmatched) > 0:
+    if excluded_count > 0:
         text += (
-            f"\n⚠️ {len(unmatched)} ta qatorda STIR na sotuvchi, na xaridur sifatida topilmadi "
-            f"— ular alohida 'Aniqlanmagan' varag'ida ko'rsatildi, hisobga kiritilmadi."
+            f"\nℹ️ {excluded_count} ta faktura qatori boshqa STIRga tegishli bo'lgani uchun "
+            f"hisobga kiritilmadi."
         )
     text += "\n\nTo'liq hisobotni Excel faylida yuboryapman 👇"
 
@@ -1137,8 +1189,13 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _steps_complete(message, context, flow):
     """Barcha qadamlar to'ldirilgach chaqiriladi: yoki hisoblaydi, yoki fayl so'raydi."""
     if flow.get("needs_file"):
-        await message.reply_text("Endi kerakli Excel faylni yuboring (.xlsx).")
-        return WAITING_TAX_REPORT_FILE
+        await message.reply_text(
+            "1/2. Endi DAROMAD hisobotini yuboring:\n\n"
+            "soliq.uz shaxsiy kabinetida QQS hisob-kitobining "
+            "'6-Илова: Йил бошидан товарларни (хизматларни) реализация қилиш бўйича айланмалар' "
+            "sahifasini oching va uni HTML sahifa sifatida saqlab (Ctrl+S), shu yerga yuboring (.html)."
+        )
+        return WAITING_TAX_INCOME_FILE
     await _finish_flow(message, context)
     return MENU
 
@@ -1275,13 +1332,45 @@ async def receive_validate_file(update: Update, context: ContextTypes.DEFAULT_TY
     return MENU
 
 
-async def receive_tax_report_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_tax_income_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc: Document = update.message.document
+    if not doc or not doc.file_name.lower().endswith((".html", ".htm")):
+        await update.message.reply_text(
+            "Iltimos, HTML fayl yuboring (soliq.uz sahifasini Ctrl+S bilan saqlab, '.html' formatda)."
+        )
+        return WAITING_TAX_INCOME_FILE
+
+    path = f"/tmp/{update.effective_chat.id}_inc_{doc.file_name}"
+    file = await doc.get_file()
+    await file.download_to_drive(path)
+
+    try:
+        stir, daromad = extract_income_from_html(path)
+    except Exception as e:
+        logger.exception("Daromad HTML faylini o'qishda xatolik")
+        await update.message.reply_text(f"❌ Xatolik yuz berdi: {e}\nQaytadan urinib ko'ring yoki /cancel bosing.")
+        return WAITING_TAX_INCOME_FILE
+
+    context.user_data["answers"]["daromad"] = daromad
+    warn = ""
+    entered_inn = _normalize_inn(context.user_data["answers"].get("inn", ""))
+    if stir and entered_inn and stir != entered_inn:
+        warn = f"\n⚠️ Diqqat: faylda topilgan STIR ({stir}) siz kiritgan STIR'dan ({entered_inn}) farq qiladi."
+
+    await update.message.reply_text(
+        f"✅ Daromad topildi: {daromad:,.0f} so'm (QQS'siz).{warn}\n\n"
+        "2/2. Endi XARAJAT uchun fakturalar 'docs' eksport faylini yuboring (.xlsx)."
+    )
+    return WAITING_TAX_EXPENSE_FILE
+
+
+async def receive_tax_expense_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc: Document = update.message.document
     if not doc or not doc.file_name.lower().endswith((".xlsx", ".xls", ".xlsm")):
         await update.message.reply_text("Iltimos, .xlsx fayl yuboring.")
-        return WAITING_TAX_REPORT_FILE
+        return WAITING_TAX_EXPENSE_FILE
 
-    path = f"/tmp/{update.effective_chat.id}_tr_{doc.file_name}"
+    path = f"/tmp/{update.effective_chat.id}_exp_{doc.file_name}"
     file = await doc.get_file()
     await file.download_to_drive(path)
 
@@ -1289,7 +1378,8 @@ async def receive_tax_report_file(update: Update, context: ContextTypes.DEFAULT_
 
     try:
         df = parse_docs_export(path)
-        result = compute_tax_report(context.user_data.get("answers", {}), df)
+        answers = context.user_data.get("answers", {})
+        result = compute_tax_report(answers, answers["daromad"], df)
     except Exception as e:
         logger.exception("Foyda solig'i hisobotida xatolik")
         await update.message.reply_text(f"❌ Xatolik yuz berdi: {e}")
@@ -1333,7 +1423,8 @@ def main():
             WAITING_FILE_1: [MessageHandler(filters.Document.ALL, receive_file_1)],
             WAITING_FILE_2: [MessageHandler(filters.Document.ALL, receive_file_2)],
             WAITING_VALIDATE_FILE: [MessageHandler(filters.Document.ALL, receive_validate_file)],
-            WAITING_TAX_REPORT_FILE: [MessageHandler(filters.Document.ALL, receive_tax_report_file)],
+            WAITING_TAX_INCOME_FILE: [MessageHandler(filters.Document.ALL, receive_tax_income_file)],
+            WAITING_TAX_EXPENSE_FILE: [MessageHandler(filters.Document.ALL, receive_tax_expense_file)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
